@@ -1,10 +1,13 @@
-VERSION=1.1
+VERSION=1.2
 IMAGE=seldonio/pipelines
 
 build:
 	rm -fr python-modules
 	cp -R ../../seldon python-modules
 	docker build -t ${IMAGE} .
+
+shell:
+	docker run -it --rm seldonio/pipelines bash
 
 clean:
 	rm -rf ./python-modules

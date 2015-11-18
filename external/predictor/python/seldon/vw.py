@@ -1,109 +1,116 @@
 import sys
 from fileutil import *
-from kazoo.client import KazooClient
 import json
 from wabbit_wappa import *
 from subprocess import call
-import seldon.pipeline.pipelines as pl
+import numpy as np
+import random
+from socket import *
+import threading, Queue, subprocess
+import time
+import psutil
+import pandas as pd
+from seldon.pipeline.pandas_pipelines import BasePandasEstimator 
+from sklearn.utils import check_X_y
+from sklearn.utils import check_array
+from sklearn.base import BaseEstimator,ClassifierMixin
 
-class VWSeldon:
-    """Wrapper to train a Vowpal Wabbit model for Seldon data
-
-    Args:
-        client (str): Name of client. Used to construct input and output full paths if not explicitPaths
-
-        awsKey (Optional[str]): AWS key. Needed if using S3 paths and no IAM
-
-        awsSecret (Optional[str]): AWS secret. Needed if using S3 paths and no IAM
-
-        zkHosts (Optional[str]): zookeeper hosts. Used to get configuation if supplied.
-
-        vwArgs (Optional[str]): training args for vowpal wabbit
-
-        features (Optional[dict]): dictionary of features and how to translate them to VW
-
-        namespaces (Optional[dict]): dictionary of features to the VW namespace to place them
-
-        include (Optional[list(str)]: features to include
-
-        exclude (Optional[list(str)]: features to exclude
-
-        target (Optional[str]): name of target feature.
-
-        target_readable (Optional[str]): name of the feature containing human readable target
-
-        dataTtpe (str): json or csv
-
-        explicitPaths (Optional[str]): whether to use the input and output paths as given
-
-        inputPath (Optional[str]): input path for features to train
-
-        outputPath (Optional[str]): output path for vw model
-
-        day (int): unix day number. Used to construct location of data
-
-        activate (boolean): whether to update zookeeper with location of new model
-
-        train_filename (Optional(str)): name of filename to create with vw training lines rather then use wabbit_wappa directly
+class VWClassifier(BasePandasEstimator,BaseEstimator,ClassifierMixin):
     """
+    Wrapper for Vowpall Wabbit classifier with pandas support
 
-    def __init__(self, client=None,awsKey=None,awsSecret=None,zkHosts=None,vwArgs="",features={}, namespaces={},include=[],exclude=None,target=None,weights=None,target_readable=None,dataType="json",explicitPaths=None,inputPath=None,day=1,outputPath=None,activate=False,train_filename=None,**kwds):
-        self.client = client
-        self.awsKey = awsKey
-        self.awsSecret = awsSecret
-        self.zk_hosts = zkHosts
-        if self.zk_hosts:
-            print "connecting to zookeeper at ",self.zk_hosts
-            self.zk_client = KazooClient(hosts=self.zk_hosts)
-            self.zk_client.start()
-        else:
-            self.zk_client = None
-        self.__merge_conf(self.client)
-        self.vwArgs = vwArgs
-        self.create_vw(vwArgs)
-        self.features = features
-        self.fns = namespaces
-        self.include = include
-        self.target = target
-        if target:
-            self.features[target] = "label"
-        self.exclude = exclude
-        self.weights = weights
-        self.target_readable = target_readable
-        self.data_type = dataType
-        self.explicit_paths = explicitPaths
-        self.inputPath = inputPath
-        self.outputPath = outputPath
-        self.day = day
-        self.activate = activate
-        self.train_filename = train_filename
+    Parameters
+    ----------
+           
+    target : str
+       Target column
+    target_readable : str
+       More descriptive version of target variable
+    included : list str, optional
+       columns to include
+    excluded : list str, optional
+       columns to exclude
+    id_map : dict (int,str), optional
+       map of class ids to high level names
+    num_iterations : int
+       number of iterations over data to run vw
+    raw_predictions_file : str
+       file to push raw predictions from vw to
+    model_file : str
+       model filename
+    pid_file : str
+       file to store pid of vw server so we can terminate it
+    vw_args : optional dict 
+       extra args to pass to vw
+    """
+    def __init__(self, target=None, target_readable=None,included=None,excluded=None,id_map={},num_iterations=1, raw_predictions_file="/tmp/raw_predictions",model_file="/tmp/model",pid_file='/tmp/vw_pid_file',**vw_args):
+        super(VWClassifier, self).__init__(target,target_readable,included,excluded,id_map)
+        self.clf = None
+        self.num_iterations = num_iterations
+        self.model_file="/tmp/model"
+        self.param_suffix="_params"
+        self.model_suffix="_model"
+        self.raw_predictions_file=raw_predictions_file
+        self.raw_predictions_thread_running = False
+        self.tailq = Queue.Queue(maxsize=1000)         
+        self.vw = None
+        self.vw_mode = None
+        self.pid_file = pid_file
+        self.vw_args = vw_args
+        self.model = None
+        self.model_saved = False
 
-        
-    def activateModel(self,client,folder):
-        """activate vw model in zookeeper
+    def __getstate__(self):
         """
-        node = "/all_clients/"+client+"/vw"
-        print "Activating model in zookeper at node ",node," with data ",folder
-        if self.zk_client.exists(node):
-            self.zk_client.set(node,folder)
-        else:
-            self.zk_client.create(node,folder,makepath=True)
-
-
-    def __merge_conf(self,client):
-        """merge zookeeper configuration into class
+        Remove things that should not be pickled
         """
-        thePath = "/all_clients/"+client+"/offline/vw"
-        if self.zk_client and self.zk_client.exists(thePath):
-            print "merging conf from zookeeper"
-            data, stat = self.zk_client.get(thePath)
-            zk_conf = json.loads(data.decode('utf-8'))
-            for k in zk_conf:
-                if not hasattr(self, k):
-                    setattr(self, k, zk_conf[k])
+        result = self.__dict__.copy()
+        del result['model_saved']
+        del result['vw']
+        del result['tailq']
+        del result['raw_predictions_thread_running']
+        return result
+
+    def __setstate__(self, dict):
+        """
+        Add thread based variables when creating
+        """
+        self.__dict__ = dict
+        self.model_saved = False
+        self.vw = None
+        self.tailq = Queue.Queue(maxsize=1000)      
+        self.raw_predictions_thread_running=False
+            
+    def _wait_model_saved(self,fname):
+        """
+        Hack to wait for vw model to finish saving. It creates a file <model>.writing during this process
+        """
+        print "waiting for ",fname
+        time.sleep(1)
+        while os.path.isfile(fname):
+            print "sleeping until model is saved"
+            time.sleep(1)
+
+    def _save_model(self,fname):
+        """
+        Save vw model from running vw instance
+        """
+        self.vw.save_model(fname)
+        self._wait_model_saved(fname+".writing")
+        with open(fname, mode='rb') as file: # b is important -> binary
+            self.model = file.read()
+
+    def _write_model(self):
+        """
+        Write the vw model to file
+        """
+        with open(self.model_file, mode='wb') as modelfile: # b is important -> binary
+            modelfile.write(self.model)
+            self.model_saved = True
+
 
     @staticmethod
-    def is_number(s):
+    def _is_number(s):
         try:
             float(s)
             return True
@@ -111,165 +118,230 @@ class VWSeldon:
             return False
 
 
-    def convertJsonFeature(self,conversion,ns,name,val):
-        """convert feature into vw feature
-           
-           if number create a feature:value vw feature else create a categorical feature from the feature name and value
+    def _get_feature(self,name,val):
         """
-        if conversion == "split":
-            f = val.split()
-            ns = ns + f
-        elif isinstance(val, basestring):
-            if self.is_number(val):
-                ns.append((name,float(val)))
-            else:
-                ns.append(name+"_"+val)
+        Create a vw feature from name and value
+        """
+        if isinstance(val, basestring):
+            if len(val) > 0:
+                if self._is_number(val):
+                    return (name,float(val))
+                else:
+                    if len(name) > 0:
+                        return (name+"_"+val)
+                    else:
+                        return (val)
         else:
-            ns.append((name,float(val)))
+            if not np.isnan(val):
+                return (name,float(val))
 
-    def jsonToVw(self,j,tag=None):
-        """convert a dict of features into vw line
-        
-        Will include and exclude features as defined args. 
-        Add weights and puts features into namespaces as directed.
+    def _convert_row(self,row,tag=None):
+        """Convert a dataframe row into a vw line
         """
         ns = {}
-        for k in set(self.fns.values()):
-            if not k == "label":
-                ns[k] = []
-        ns['def'] = []
-        label = None
-        importance = 1.0
-        for k in j:
-            if self.exclude and k in self.exclude:
-                continue
-            if self.include and not k in self.include and not k in self.features:
-                continue
-            if not k in self.fns:
-                self.fns[k] = 'def'
-            ns_f = ns[self.fns[k]]
-            if k in self.features:
-                conversion = self.features[k] 
-                if conversion == "split":
-                    self.convertJsonFeature(conversion,ns_f,k,j[k])                    
-                elif conversion == "label":
-                    label = int(j[k])
-                    if self.weights and j[k] in self.weights:
-                        importance = self.weights[j[k]]
-            else:
-                if isinstance(j[k], list):
-                    for v in j[k]:
-                        if isinstance(v,basestring):
-                            self.convertJsonFeature(None,ns_f,k,v)
-                        else:
-                            self.convertJsonFeature(None,ns_f,k,k+str(v))
-                elif isinstance(j[k], dict):
-                    for k2 in j[k]:
-                        self.convertJsonFeature(None,ns_f,k2,j[k][k2])
-                else:
-                    self.convertJsonFeature(None,ns_f,k,j[k])
+        ns["def"] = []
+        for col in row.index.values:
+            if not col == self.target:
+                val = row[col]
+                feature = None
+                if isinstance(val,basestring):
+                    feature = self._get_feature(col,val)
+                    if not feature is None:
+                        ns["def"].append(feature)
+                elif isinstance(val,dict):
+                    for key in val:
+                        feature = self._get_feature(str(key),val[key])
+                        if not feature is None:
+                            if not col in ns:
+                                ns[col] = []
+                            ns[col].append(feature)
+                elif isinstance(val,list):
+                    for v in val:
+                        feature = self._get_feature("",v)
+                        if not feature is None:
+                            if not col in ns:
+                                ns[col] = []
+                            ns[col].append(feature)
+        if self.target in row:
+            target = row[self.target]
+            target = int(target)
+            if self.zero_based:
+                target += 1
+        else:
+            target = None
         namespaces = []
         for k in ns:
             if not k == 'def':
                 namespaces.append(Namespace(name=k,features=ns[k]))
-        if len(ns['def']) == 0 and len(ns) == 1:
-            return None
-        if len(ns['def']) == 0:
-            ns['def'] = None
-        if self.weights:
-            return self.vw2.make_line(response=label,importance=importance,tag=tag,features=ns['def'],namespaces=namespaces)
-        else:
-            return self.vw2.make_line(response=label,tag=tag,features=ns['def'],namespaces=namespaces)
-        
-    def create_vw(self,vwArgs):
-        """Create wabbit_wappa vw instance for creating the training lines and possibly doing the training
-        """
-        command = "vw --save_resume --predictions /dev/stdout --quiet "+vwArgs + " --readable_model ./model.readable"
-        print command
-        self.vw2 =  VW(command=command)
-        print self.vw2.command
+        return self.vw.make_line(response=target,features=ns['def'],namespaces=namespaces)
+    
+    @staticmethod
+    def _sigmoid(x):
+        return 1 / (1 + math.exp(-x))
 
-    def process(self,j):
-        """process the lines from the input and turn into vw lines
+    @staticmethod        
+    def _normalize( predictions ):
+        s = sum( predictions )
+        normalized = []
+        for p in predictions:
+            normalized.append( p / s )
+        return normalized  
+
+    def _start_raw_predictions(self):
+        """Start a thread to tail the raw predictions file
         """
-        vwLine = self.jsonToVw(j)
-        self.numLinesProcessed += 1
-        if vwLine:
-            if self.target_readable:
-                self.target_map[j[self.target]] = j[self.target_readable]
-            if self.train_file:
-                self.train_file.write(vwLine+"\n")
+        if not self.raw_predictions_thread_running:
+            thread = threading.Thread(target=self._tail_forever, args=(self.raw_predictions_file,))
+            thread.setDaemon(True)
+            thread.start()
+            self.raw_predictions_thread_running = True
+
+    def close(self):
+        """Shutdown the vw process
+        """
+        if not self.vw is None:
+            f=open(self.pid_file)
+            for line in f:
+                print "terminating pid ",line
+                p = psutil.Process(int(line))
+                p.terminate()
+            self.vw.close()
+            self.vw = None
+
+
+    def _tail_forever(self,fn):
+        """Tail the raw predictions file so we can get class probabilities when doing predictions
+        """
+        p = subprocess.Popen(["tail", "-f", fn], stdout=subprocess.PIPE)
+        while 1:
+            line = p.stdout.readline()
+            self.tailq.put(line)
+            if not line:
+                break
+
+    def _get_full_scores(self):
+        """Get the predictions from the vw raw predictions and normalise them
+        """
+        rawLine = self.tailq.get()
+        parts = rawLine.split(' ')
+        tagScores = parts[len(parts)-1].rstrip() 
+        scores = []
+        for score in parts:
+            (classId,score) = score.split(':')
+            scores.append(self._sigmoid(float(score)))
+        nscores = self._normalize(scores)
+        fscores = []
+        c = 1
+        for nscore in nscores:
+            fscores.append(nscore)
+            c = c + 1
+        return np.array(fscores)
+
+    def _exclude_include_features(self,df):
+        if not self.included is None:
+            print "including features ",self.included
+            df = df[list(set(self.included+[self.target]).intersection(df.columns))]
+        if not self.excluded is None:
+            print "excluding features",self.excluded
+            df = df.drop(set(self.excluded).intersection(df.columns), axis=1)
+        return df
+
+
+    def fit(self,X,y=None):
+        """Convert data to vw lines and then train for required iterations
+           
+        Parameters
+        ----------
+
+        X : pandas dataframe or array-like
+           training samples
+        y : array like, required for array-like X and not used presently for pandas dataframe
+           class labels
+
+        Returns
+        -------
+        self: object
+
+        Caveats : 
+        1. A seldon specific fork of wabbit_wappa is needed to allow vw to run in server mode without save_resume. Save_resume seems to cause issues with the scores returned. Maybe connected to https://github.com/JohnLangford/vowpal_wabbit/issues/262
+        """
+        if isinstance(X,pd.DataFrame):
+            df = X
+            df_base = self._exclude_include_features(df)
+            df_base = df_base.fillna(0)
+        else:
+            check_X_y(X,y)
+            df = pd.DataFrame(X)
+            df_y = pd.DataFrame(y,columns=list('y'))
+            self.target='y'
+            df_base = pd.concat([df,df_y],axis=1)
+            print df_base.head()
+
+        min_target = df_base[self.target].astype(float).min()
+        print "min target ",min_target
+        if min_target == 0:
+            self.zero_based = True
+        else:
+            self.zero_based = False
+        if not self.target_readable is None:
+            self.create_class_id_map(df,self.target,self.target_readable,zero_based=self.zero_based)
+
+        self.num_classes = len(df_base[self.target].unique())
+        print "num classes ",self.num_classes
+        self._start_vw_if_needed("train")
+        df_vw = df_base.apply(self._convert_row,axis=1)
+        for i in range(0,self.num_iterations):
+            for (index,val) in df_vw.iteritems():
+                self.vw.send_line(val,parse_result=False)
+        self._save_model(self.model_file)        
+        return self
+
+    def _start_vw_if_needed(self,mode):
+        if self.vw is None or self.vw_mode != mode:
+            print "Creating vw in mode",mode
+            if not self.vw is None:
+                self.close()
+            if mode == "test":
+                if not self.model_saved:
+                    self._write_model()
+                self.vw =  VW(server_mode=True,pid_file=self.pid_file,port=29743,num_children=1,i=self.model_file,raw_predictions=self.raw_predictions_file,t=True)
             else:
-                self.vw2.send_line(vwLine)
+                self.vw =  VW(server_mode=True,pid_file=self.pid_file,port=29742,num_children=1,oaa=self.num_classes,**self.vw_args)
+            print self.vw.command
+            self.vw_mode = mode
 
-                
-    def save_data(self,line):
-        """save data to local file
-        """
-        self.local_input.write(line+"\n")
 
+    def predict_proba(self,X):
+        """Create predictions. Start a vw process. Convert data to vw format and send. 
+        Returns class probability estimates for the given test data.
+
+        X : pandas dataframe or array-like
+            Test samples 
         
-    def save_target_map(self):
-        """save mapping of target ids to their descriptive meanings
+        Returns
+        -------
+        proba : array-like, shape = (n_samples, n_outputs)
+            Class probability estimates.
+  
+        Caveats : 
+        1. A seldon specific fork of wabbit_wappa is needed to allow vw to run in server mode without save_resume. Save_resume seems to cause issues with the scores returned. Maybe connected to https://github.com/JohnLangford/vowpal_wabb#it/issues/262
         """
-        v = json.dumps(self.target_map,sort_keys=True)
-        f = open('./target_map.json',"w")
-        f.write(v)
-        f.close()
-
-
-    def train(self,train_filename=None,vw_command=None):
-        """train a vw model from input and save to output
-        """
-        self.numLinesProcessed = 0
-        self.target_map = {}
-        if train_filename:
-            self.train_file = open(train_filename,"w")
+        self._start_vw_if_needed("test")
+        if isinstance(X,pd.DataFrame):
+            df = X
+            df_base = self._exclude_include_features(df)
+            df_base = df_base.fillna(0)
         else:
-            self.train_file = None
-        #stream data into vw
-        if self.explicit_paths:
-            inputPath = self.inputPath
-        else:
-            inputPath = self.inputPath + "/" + self.client + "/features/" + str(self.day) + "/"
-        print "inputPath->",inputPath
-        
-        # stream data to local file
-        fileUtil = FileUtil(key=self.awsKey,secret=self.awsSecret)
-        self.local_input = open("./data","w")
-        fileUtil.stream(inputPath,self.save_data)
-        self.local_input.close()
-
-        #build vw training 
-        if self.data_type == "csv":
-            features = pl.CsvDataSet("./data")
-        else:
-            features = pl.JsonDataSet("./data")
-        for d in features:
-            self.process(d)
-
-        # save vw model
-        if train_filename:
-            self.vw2.close()
-            self.train_file.close()
-            r = call(["vw","--data",train_filename,"-f","model","--cache_file","./cache_file","--readable_model","./model.readable"]+self.vwArgs.split())
-            print "called and got ",r
-        else:
-            self.vw2.save_model("./model")
-            self.vw2.close()
-            print "lines processed ",self.numLinesProcessed
-
-        self.save_target_map()
-        # copy models to final location
-        if self.explicit_paths:
-            outputPath = self.outputPath
-        else:
-            outputPath = self.outputPath + "/" + self.client + "/vw/" + str(self.day)
-        print "outputPath->",outputPath
-        fileUtil.copy("./model",outputPath+"/model")
-        fileUtil.copy("./model.readable",outputPath+"/model.readable")
-        fileUtil.copy("./target_map.json",outputPath+"/target_map.json")
-
-        #activate model in zookeeper
-        if self.activate:
-            self.activateModel(self.client,str(outputPath))
+            check_array(X)
+            df_base = pd.DataFrame(X)
+        df_vw = df_base.apply(self._convert_row,axis=1)
+        predictions = None
+        for (index,val) in df_vw.iteritems():
+            prediction = self.vw.send_line(val,parse_result=True)
+            self._start_raw_predictions()
+            scores = self._get_full_scores()
+            if predictions is None:
+                predictions = np.array([scores])
+            else:
+                predictions = np.vstack([predictions,scores])
+        return predictions

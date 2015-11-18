@@ -1,257 +1,210 @@
 import sys
-from fileutil import *
-from kazoo.client import KazooClient
-import json
-from collections import OrderedDict
 import numpy as np
-import xgboost
+import xgboost as xgb
 from sklearn.datasets import load_svmlight_file
 import scipy.sparse
+import math
+import pandas as pd
+from sklearn.feature_extraction import DictVectorizer
+from seldon.pipeline.pandas_pipelines import BasePandasEstimator 
+from collections import OrderedDict
+import io
+from sklearn.utils import check_X_y
+from sklearn.utils import check_array
+from sklearn.base import BaseEstimator,ClassifierMixin
 
-
-class XGBoostSeldon:
-    """Seldon wrapper for training XGBoost models
-
-       Input from local or S3. Files can be JSON or a single CSV file.
-       Output model to local or S3.
-
-    Args:
-        client (str): Name of client. Used to construct input and output full paths if not explicitPaths
-
-        awsKey (Optional[str]): AWS key. Needed if using S3 paths and no IAM
-
-        awsSecret (Optional[str]): AWS secret. Needed if using S3 paths and no IAM
-
-        zkHosts (Optional[str]): zookeeper hosts. Used to get configuation if supplied.
-
-        svmFeatures (Optional[dict]): dictionary of svm (numeric key) features to their values
-
-        target (Optional[str]): name of target feature.
-
-        target_readable (Optional[str]): name of the feature containing human readable target
-
-        inputPath (Optional[str]): input path for features to train
-
-        outputPath (Optional[str]): output path for vw model
-
-        day (int): unix day number. Used to construct location of data
-
-        activate (boolean): whether to update zookeeper with location of new model
+class XGBoostClassifier(BasePandasEstimator,BaseEstimator,ClassifierMixin):
     """
-    def __init__(self, client=None,awsKey=None,awsSecret=None,zkHosts=None,svmFeatures={},target=None,target_readable=None,zeroBased=False,inputPath=None,day=1,outputPath=None,activate=False,**kwds):
-        self.client = client
-        self.awsKey = awsKey
-        self.awsSecret = awsSecret
-        self.zk_hosts = zkHosts
-        if self.zk_hosts:
-            print "connecting to zookeeper at ",self.zk_hosts
-            self.zk_client = KazooClient(hosts=self.zk_hosts)
-            self.zk_client.start()
-        else:
-            self.zk_client = None
-        self.conf = self.__merge_conf(self.client)
-        self.svm_features = svmFeatures
-        self.target= target
-        self.target_readable = target_readable
-        self.correct = 0
-        self.predicted = 0
-        self.zero_based = zeroBased
-        self.inputPath = inputPath
-        self.outputPath = outputPath
-        self.day = day
-        self.activate = activate
+    Wrapper for XGBoost classifier with pandas support
+    XGBoost specific arguments follow https://github.com/dmlc/xgboost/blob/master/python-package/xgboost/sklearn.py
 
-
-    def activateModel(self,client,folder):
-        """activate vw model in zookeeper
-        """
-        node = "/all_clients/"+client+"/xgboost"
-        print "Activating model in zookeper at node ",node," with data ",folder
-        if self.zk_client.exists(node):
-            self.zk_client.set(node,folder)
-        else:
-            self.zk_client.create(node,folder,makepath=True)
-
-    def __merge_conf(self,client):
-        """merge zookeeper configuration into class
-        """
-        thePath = "/all_clients/"+client+"/offline/vw"
-        if self.zk_client and self.zk_client.exists(thePath):
-            print "merging conf from zookeeper"
-            data, stat = self.zk_client.get(thePath)
-            zk_conf = json.loads(data.decode('utf-8'))
-            for k in zk_conf:
-                if not hasattr(self, k):
-                    setattr(self, k, zk_conf[k])
-    
-    def jsonToSvm(self,j):
-        """convert dictionary to svm line
-
-        Args:
-            j (dict): dictionary of SVM features. Assumes numeric keys which can be sorted and numeric values
-        """
-        if self.svm_features in j:
-            line = str(j[self.target])
-            d = j[self.svm_features]
-            b = OrderedDict(sorted(d.items(), key=lambda t: float(t[0])))
-            for k in b:
-                line += (" "+str(k)+":"+str(b[k]))
-            return line
-        else:
-            return None
-
-    def process(self,line):
-        """process the lines from the input and turn into SVMLight lines
-        """
-        j = json.loads(line)
-        svmLine = self.jsonToSvm(j)
-        self.numLinesProcessed += 1
-        if svmLine:
-            if self.target_readable:
-                self.target_map[j[self.target]] = j[self.target_readable]
-            if self.train_file:
-                self.train_file.write(svmLine+"\n")
+    Parameters
+    ----------
+           
+    target : str
+       Target column
+    target_readable : str
+       More descriptive version of target variable
+    included : list str, optional
+       columns to include
+    excluded : list str, optional
+       columns to exclude
+    id_map : dict (int,str), optional
+       map of class ids to high level names
+    num_iterations : int
+       number of iterations over data to run vw
+    raw_predictions : str
+       file to push raw predictions from vw to
+    max_depth : int
+        Maximum tree depth for base learners.
+    learning_rate : float
+        Boosting learning rate (xgb's "eta")
+    n_estimators : int
+        Number of boosted trees to fit.
+    silent : boolean
+        Whether to print messages while running boosting.
+    objective : string
+        Specify the learning task and the corresponding learning objective.
+    nthread : int
+        Number of parallel threads used to run xgboost.
+    gamma : float
+        Minimum loss reduction required to make a further partition on a leaf node of the tree.
+    min_child_weight : int
+        Minimum sum of instance weight(hessian) needed in a child.
+    max_delta_step : int
+        Maximum delta step we allow each tree's weight estimation to be.
+    subsample : float
+        Subsample ratio of the training instance.
+    colsample_bytree : float
+        Subsample ratio of columns when constructing each tree.
+    colsample_bylevel : float
+        Subsample ratio of columns for each split, in each level.
+    reg_alpha : float (xgb's alpha)
+        L2 regularization term on weights
+    reg_lambda : float (xgb's lambda)
+        L1 regularization term on weights
+    scale_pos_weight : float
+        Balancing of positive and negative weights.
+    base_score:
+        The initial prediction score of all instances, global bias.
+    seed : int
+        Random number seed.
+    missing : float, optional
+        Value in the data which needs to be present as a missing value. If
+        None, defaults to np.nan.
+    """
+    def __init__(self, target=None, target_readable=None,included=None,excluded=None,clf=None,
+                 id_map={},vectorizer=None,svmlight_feature=None, 
+                 max_depth=3, learning_rate=0.1, n_estimators=100,
+                 silent=True, objective="reg:linear",
+                 nthread=-1, gamma=0, min_child_weight=1, max_delta_step=0,
+                 subsample=1, colsample_bytree=1, colsample_bylevel=1,
+                 reg_alpha=0, reg_lambda=1, scale_pos_weight=1,
+                 base_score=0.5, seed=0, missing=None):
+        super(XGBoostClassifier, self).__init__(target,target_readable,included,excluded,id_map)
+        self.vectorizer = vectorizer
+        self.clf = clf
+        self.max_depth=max_depth 
+        self.learning_rate=learning_rate
+        self.n_estimators=n_estimators
+        self.silent=silent
+        self.objective=objective
+        self.nthread=nthread
+        self.gamma=gamma 
+        self.min_child_weight=min_child_weight
+        self.max_delta_step=max_delta_step
+        self.subsample=subsample 
+        self.colsample_bytree=colsample_bytree
+        self.colsample_bylevel=colsample_bylevel
+        self.reg_alpha=reg_alpha
+        self.reg_lambda=reg_lambda
+        self.scale_pos_weight=scale_pos_weight
+        self.base_score=base_score
+        self.seed=seed
+        self.missing=missing
+        #self.params = { "max_depth":max_depth,"learning_rate":learning_rate,"n_estimators":n_estimators,
+        #               "silent":silent, "objective":objective,
+        #               "nthread":nthread, "gamma":gamma, "min_child_weight":min_child_weight, "max_delta_step":max_delta_step,
+        #               "subsample":subsample, "colsample_bytree":colsample_bytree, "colsample_bylevel":colsample_bylevel,
+        #               "reg_alpha":reg_alpha, "reg_lambda":reg_lambda, "scale_pos_weight":scale_pos_weight,
+        #               "base_score":base_score, "seed":seed, "missing":missing }
+        self.svmlight_feature = svmlight_feature
         
-    def save_target_map(self):
-        """save mapping of target ids to their descriptive meanings
+
+    def _to_svmlight(self,row):
+        """Convert a dataframe row containing a dict of id:val to svmlight line
         """
-        v = json.dumps(self.target_map,sort_keys=True)
-        f = open('./target_map.json',"w")
-        f.write(v)
-        f.close()
-
-    def train_model(self):
-        """train an xgboost model from generated SVM features file
-        """
-        train_X, train_Y = load_svmlight_file("train.svm",zero_based=self.zero_based)
-        xg_train = xgboost.DMatrix(train_X,label=train_Y)
-        # setup parameters for xgboost
-        param = {}
-        #    param['objective'] = 'multi:softmax'
-        param['objective'] = 'multi:softprob'
-        # scale weight of positive examples
-        param['eta'] = 0.1
-        param['max_depth'] = 15
-        param['silent'] = 1
-        param['nthread'] = 6
-        param['num_class'] = len(self.target_map) + 1
-        watchlist = [ (xg_train,'train') ]
-        num_round = 5
-        bst = xgboost.train(param, xg_train, num_round, watchlist );
-        bst.save_model('model')
-
-
-    def train(self):
-        """train an XGBoost model using features from inputPath and putting model in outputPath
-        """
-        self.numLinesProcessed = 0
-        self.target_map = {}
-        self.train_file = open("train.svm","w")
-
-        #stream data into vw
-        inputPath = self.inputPath + "/" + self.client + "/features/" + str(self.day) + "/"
-        print "inputPath->",inputPath
-        fileUtil = FileUtil(key=self.awsKey,secret=self.awsSecret)
-        fileUtil.stream(inputPath,self.process)
-        self.train_file.close()
-        
-        self.train_model()
-
-        self.save_target_map()
-        # copy models to final location
-        outputPath = self.outputPath + "/" + self.client + "/xgboost/" + str(self.day)
-        print "outputPath->",outputPath
-        fileUtil.copy("./model",outputPath+"/model")
-        fileUtil.copy("./target_map.json",outputPath+"/target_map.json")
-
-        #activate model in zookeeper
-        if self.activate:
-            self.activateModel(self.client,str(outputPath))
-
-
-    def test(self,test_features_path):
-        """test model against features from file
-        """
-        fileUtil = FileUtil(key=self.awsKey,secret=self.awsSecret)
-        fileUtil.stream(test_features_path,self.predict_line)
-        return self.get_accuracy()
-        
-    def load_models(self):
-        """load an xgboost model
-        """
-        inputPath = self.inputPath + "/" + self.client + "/xgboost/" + str(self.day)
-        fileUtil = FileUtil(key=self.awsKey,secret=self.awsSecret)
-        fileUtil.copy(inputPath,".")
-        f = open("./target_map.json")
-        for line in f:
-            line = line.rstrip()
-            self.targetMap = json.loads(line)
-            break
-        self.bst = xgboost.Booster(model_file="./model")
-        
-    def generate_dmatrix(self,features):
-        """generate dmatrix from input for xgboost model
-
-        Args:
-            features (dict): dictionary of features to score
-
-        Returns: generated dmatricx
-        """
-        row = []; col = []; dat = []
-        for k in features:
-            colIdx = int(k)
-            if not self.zero_based:
-                colIdx = colIdx - 1
-            row.append(0); col.append(colIdx); dat.append(float(features[k]))
-        if len(row) > 0:
-            csr = scipy.sparse.csr_matrix((dat, (row,col)))
+        if self.target in row:
+            line = str(row[self.target])
         else:
-            csr = scipy.sparse.csr_matrix((1, 1), dtype=np.float64)
-        xg_test = xgboost.DMatrix(csr)
-        return xg_test
-            
-    def predict_line(self,line):
-        """predict line against a model
-
-        Args:
-            line (str): input feature line in SVM format
+            line = "1"
+        d = row[self.svmlight_feature]
+        for (k,v) in d:
+            line += (" "+str(k)+":"+str(v))
+        return line
+        
+    def _load_from_svmlight(self,df):
+        """Load data from dataframe with dict of id:val into numpy matrix
         """
-        j = json.loads(line)
-        yprob = self.predict(j[self.svm_features])
-        correct = int(j[self.target])
-        ylabel = np.argmax(yprob, axis=1)[0]
-        self.predicted += 1
-        if correct == ylabel:
-            self.correct += 1
+        print "loading from dictionary feature"
+        df_svm = df.apply(self._to_svmlight,axis=1)
+        output = io.BytesIO()
+        df_svm.to_csv(output,index=False,header=False)
+        output.seek(0)
+        (X,y) = load_svmlight_file(output,zero_based=False)
+        output.close()
+        return (X,y)
 
-    def predict_json(self,j):
-        """predict against a model features in j
 
-        Args:
-            j (dict): dictionary of features
+    def fit(self,X,y=None):
+        """Fit a model: 
 
-        Returns: scores for each class
+        Parameters
+        ----------
+
+        X : pandas dataframe or array-like
+           training samples. If pandas dataframe can handle dict of feature in one column or cnvert a set of columns
+        y : array like, required for array-like X and not used presently for pandas dataframe
+           class labels
+
+        Returns
+        -------
+        self: object
+
+
         """
-        fscores = []
-        yprob = self.predict(j[self.svm_features])
-        if len(yprob) > 0:
-            yprob = yprob[0]
-            for i in range(1,len(yprob)):
-                fscores.append((yprob[i],self.targetMap[str(i)],1.0))
-        return fscores
+        if isinstance(X,pd.DataFrame):
+            df = X
+            if not self.svmlight_feature is None:
+                if not self.target_readable is None:
+                    self.create_class_id_map(df,self.target,self.target_readable)
+                (X,y) = self._load_from_svmlight(df)
+                num_class = len(np.unique(y))
+            else:
+                (X,y,self.vectorizer) = self.convert_numpy(df)
+                num_class = len(y.unique())
+        else:
+            check_X_y(X,y)
+            num_class = len(np.unique(y))
 
-    def predict(self,features):
-        """predict againts a model using features
+        self.clf = xgb.XGBClassifier(max_depth=self.max_depth, learning_rate=self.learning_rate, 
+                                     n_estimators=self.n_estimators,
+                                     silent=self.silent, objective=self.objective,
+                                     nthread=self.nthread, gamma=self.gamma, 
+                                     min_child_weight=self.min_child_weight, 
+                                     max_delta_step=self.max_delta_step,
+                                     subsample=self.subsample, colsample_bytree=self.colsample_bytree, 
+                                     colsample_bylevel=self.colsample_bylevel,
+                                     reg_alpha=self.reg_alpha, reg_lambda=self.reg_lambda, 
+                                     scale_pos_weight=self.scale_pos_weight,
+                                     base_score=self.base_score, seed=self.seed, missing=self.missing)
+        print self.clf.get_params(deep=True)
+        self.clf.fit(X,y,verbose=True)
+        return self
 
-        Args:
-            features (dict): features to predict against
-
-        Returns: predictions
+    def predict_proba(self, X):
         """
-        preds = self.bst.predict(self.generate_dmatrix(features))
-        return preds
+        Returns class probability estimates for the given test data.
 
-    def get_accuracy(self):
-        """get accuracy of test
+        X : pandas dataframe or array-like
+            Test samples 
+        
+        Returns
+        -------
+        proba : array-like, shape = (n_samples, n_outputs)
+            Class probability estimates.
+  
         """
-        return self.correct / float(self.predicted)
+        if isinstance(X,pd.DataFrame):
+            df = X
+            if not self.svmlight_feature is None:
+                (X,_) = self._load_from_svmlight(df)
+            else:
+                (X,_,_) = self.convert_numpy(df)
+        else:
+            check_array(X)
+
+        return self.clf.predict_proba(X)
+
+
+
